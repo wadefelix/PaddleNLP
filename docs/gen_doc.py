@@ -1,0 +1,469 @@
+import paddlenlp
+import os
+import shutil
+import time
+import pkgutil
+import types
+import contextlib
+import argparse
+import json
+import sys
+import inspect
+import ast
+import logging
+"""
+generate api_info_dict.json to describe all info about the apis.
+"""
+
+en_suffix = ".rst"
+cn_suffix = "_cn.rst"
+
+# key = id(api), value = dict of api_info{
+#   "id":id,
+#   "all_names":[],  # all full_names
+#   "full_name":"",  # the real name, and the others are the alias name
+#   "short_name":"",  # without module name
+#   "alias_name":"",  # without module name
+#   "module_name":"",  # the module of the real api belongs to
+#   "display":True/Flase, # consider the not_display_doc_list and the display_doc_list
+#   "has_overwrited_doc":True/False  #
+#   "doc_filename"  # document filename without suffix
+# }
+api_info_dict = {}
+parsed_mods = {}
+
+logging.basicConfig(
+    format="%(asctime)s - %(lineno)d - %(levelname)s - %(message)s")
+logger = logging.getLogger()
+
+# logger.setLevel(logging.DEBUG)
+
+MODULE=paddlenlp
+MODULE_PATH=MODULE.__path__
+#MODULE_PATH_PREFIX_LEN=len(MODULE_PATH)
+MODULE_PATH_PREFIX_LEN=0
+
+# step 1: walkthrough the paddle package to collect all the apis in api_set
+def get_all_api(root_path=MODULE.__name__, attr="__all__"):
+    """
+    walk through the paddle package to collect all the apis.
+    """
+    global api_info_dict
+    api_counter = 0
+    for filefinder, name, ispkg in pkgutil.walk_packages(
+            path=MODULE.__path__, prefix=MODULE.__name__ + '.'):
+        try:
+            #m = eval(name)
+            if name in sys.modules:
+                m = sys.modules[name]
+            else:
+                continue
+        except AttributeError:
+            logger.warning("AttributeError occurred when `eval(%s)`", name)
+            pass
+        else:
+            logger.debug("processing %s", m.__name__)
+            api_counter += process_module(m, attr)
+
+    api_counter += process_module(MODULE, attr)
+    logger.info('collected %d apis, %d distinct apis.', api_counter,
+                len(api_info_dict))
+
+
+# step 1 fill field : `id` & `all_names`, type
+def process_module(m, attr="__all__"):
+    api_counter = 0
+    if hasattr(m, attr):
+        # may have duplication of api
+        for api in set(getattr(m, attr)):
+            if api[0] == '_': continue
+            # Exception occurred when `id(eval(paddle.dataset.conll05.test, get_dict))`
+            if ',' in api: continue
+
+            # api's fullname
+            full_name = m.__name__ + "." + api
+            try:
+                obj = eval(full_name)
+                fc_id = id(obj)
+            except AttributeError:
+                logger.warning("AttributeError occurred when `id(eval(%s))`",
+                               full_name)
+                pass
+            except:
+                logger.warning("Exception occurred when `id(eval(%s))`",
+                               full_name)
+            else:
+                api_counter += 1
+                logger.debug("adding %s to api_info_dict.", full_name)
+                if fc_id in api_info_dict:
+                    api_info_dict[fc_id]["all_names"].add(full_name)
+                else:
+                    api_info_dict[fc_id] = {
+                        "all_names": set([full_name]),
+                        "id": fc_id,
+                        "object": obj,
+                        "type": type(obj).__name__,
+                    }
+    return api_counter
+
+
+# step 3 fill field : args, src_file, lineno, end_lineno, short_name, full_name, module_name, doc_filename
+def set_source_code_attrs():
+    """
+    should has 'full_name' first.
+    """
+    src_file_start_ind = len(MODULE.__path__[0]) - MODULE_PATH_PREFIX_LEN
+    # ast module has end_lineno attr after py 3.8
+
+    for id_api in api_info_dict:
+        item = api_info_dict[id_api]
+        obj = item["object"]
+        obj_type_name = item["type"]
+        logger.debug("processing %s:%s:%s", obj_type_name, item["id"],
+                     str(obj))
+        if obj_type_name == "module":
+            if hasattr(obj, '__file__') and obj.__file__ is not None and len(
+                    obj.__file__) > src_file_start_ind:
+                api_info_dict[id_api]["src_file"] = obj.__file__[
+                    src_file_start_ind:]
+            parse_module_file(obj)
+            api_info_dict[id_api]["full_name"] = obj.__name__
+            api_info_dict[id_api]["package"] = obj.__package__
+            api_info_dict[id_api]["short_name"] = split_name(obj.__name__)[1]
+        elif hasattr(obj, '__module__') and obj.__module__ in sys.modules:
+            mod_name = obj.__module__
+            mod = sys.modules[mod_name]
+            parse_module_file(mod)
+        else:
+            if hasattr(obj, '__name__'):
+                mod_name, short_name = split_name(obj.__name__)
+                if mod_name in sys.modules:
+                    mod = sys.modules[mod_name]
+                    parse_module_file(mod)
+                else:
+                    logger.debug("{}, {}, {}".format(item["id"], item["type"],
+                                                     item["all_names"]))
+            else:
+                found = False
+                for name in item["all_names"]:
+                    mod_name, short_name = split_name(name)
+                    if mod_name in sys.modules:
+                        mod = sys.modules[mod_name]
+                        parse_module_file(mod)
+                        found = True
+                if not found:
+                    logger.debug("{}, {}, {}".format(item["id"], item["type"],
+                                                     item["all_names"]))
+
+
+def split_name(name):
+    try:
+        r = name.rindex('.')
+        return [name[:r], name[r + 1:]]
+    except:
+        return ['', name]
+
+
+def parse_module_file(mod):
+    skip_this_mod = False
+    if mod in parsed_mods:
+        skip_this_mod = True
+    if skip_this_mod:
+        return
+    else:
+        parsed_mods[mod] = True
+
+    src_file_start_ind = len(MODULE.__path__[0]) - MODULE_PATH_PREFIX_LEN
+    has_end_lineno = sys.version_info > (3, 8)
+    if hasattr(mod, '__name__') and hasattr(mod, '__file__'):
+        src_file = mod.__file__
+        mod_name = mod.__name__
+        logger.debug("parsing %s:%s", mod_name, src_file)
+        if len(mod_name) >= len(MODULE.__name__) and mod_name[:len(MODULE.__name__)] == MODULE.__name__:
+            if os.path.splitext(src_file)[1].lower() == '.py':
+                mod_ast = ast.parse(open(src_file, "r").read())
+                for node in mod_ast.body:
+                    short_names = []
+                    if ((isinstance(node, ast.ClassDef) or
+                         isinstance(node, ast.FunctionDef)) and
+                            hasattr(node, 'name') and
+                            hasattr(sys.modules[mod_name],
+                                    node.name) and node.name[0] != '_'):
+                        short_names.append(node.name)
+                    elif isinstance(node, ast.Assign):
+                        for target in node.targets:
+                            if hasattr(target, 'id') and target.id[0] != '_':
+                                short_names.append(target.id)
+                    else:
+                        pass
+                    for short_name in short_names:
+                        obj_full_name = mod_name + '.' + short_name
+                        logger.debug("processing %s", obj_full_name)
+                        try:
+                            obj_this = eval(obj_full_name)
+                            obj_id = id(obj_this)
+                        except:
+                            logger.warning("%s maybe %s.%s", obj_full_name,
+                                           mod.__package__, short_name)
+                            obj_full_name = mod.__package__ + '.' + short_name
+                            try:
+                                obj_this = eval(obj_full_name)
+                                obj_id = id(obj_this)
+                            except:
+                                continue
+                        if obj_id in api_info_dict and "lineno" not in api_info_dict[
+                                obj_id]:
+                            api_info_dict[obj_id]["src_file"] = src_file[
+                                src_file_start_ind:]
+                            api_info_dict[obj_id][
+                                "doc_filename"] = obj_full_name.replace('.',
+                                                                        '/')
+                            api_info_dict[obj_id]["full_name"] = obj_full_name
+                            api_info_dict[obj_id]["short_name"] = short_name
+                            api_info_dict[obj_id]["module_name"] = mod_name
+                            api_info_dict[obj_id]["lineno"] = node.lineno
+                            if has_end_lineno:
+                                api_info_dict[obj_id][
+                                    "end_lineno"] = node.end_lineno
+                            if isinstance(node, ast.FunctionDef):
+                                api_info_dict[obj_id][
+                                    "args"] = gen_functions_args_str(node)
+                            elif isinstance(node, ast.ClassDef):
+                                for n in node.body:
+                                    if hasattr(
+                                            n,
+                                            'name') and n.name == '__init__':
+                                        api_info_dict[obj_id][
+                                            "args"] = gen_functions_args_str(n)
+                                        break
+                        else:
+                            logger.debug("%s omitted", obj_full_name)
+            else:  # pybind11 ...
+                for short_name in mod.__dict__:
+                    if short_name[0] != '_':
+                        obj_full_name = mod_name + '.' + short_name
+                        logger.debug("processing %s", obj_full_name)
+                        try:
+                            obj_this = eval(obj_full_name)
+                            obj_id = id(obj_this)
+                        except:
+                            logger.warning("%s eval error", obj_full_name)
+                            continue
+                        if obj_id in api_info_dict and "lineno" not in api_info_dict[
+                                obj_id]:
+                            api_info_dict[obj_id]["src_file"] = src_file[
+                                src_file_start_ind:]
+                            api_info_dict[obj_id]["full_name"] = obj_full_name
+                            api_info_dict[obj_id]["short_name"] = short_name
+                            api_info_dict[obj_id]["module_name"] = mod_name
+                        else:
+                            logger.debug("%s omitted", obj_full_name)
+
+
+def gen_functions_args_str(node):
+    str_args_list = []
+    if isinstance(node, ast.FunctionDef):
+        # 'args', 'defaults', 'kw_defaults', 'kwarg', 'kwonlyargs', 'posonlyargs', 'vararg'
+        for arg in node.args.args:
+            if not arg.arg == 'self':
+                str_args_list.append(arg.arg)
+
+        defarg_ind_start = len(str_args_list) - len(node.args.defaults)
+        for defarg_ind in range(len(node.args.defaults)):
+            if isinstance(node.args.defaults[defarg_ind], ast.Name):
+                str_args_list[defarg_ind_start + defarg_ind] += '=' + str(
+                    node.args.defaults[defarg_ind].id)
+            elif isinstance(node.args.defaults[defarg_ind], ast.Constant):
+                str_args_list[defarg_ind_start + defarg_ind] += '=' + str(
+                    node.args.defaults[defarg_ind].value)
+        if node.args.vararg is not None:
+            str_args_list.append('*' + node.args.vararg.arg)
+        if len(node.args.kwonlyargs) > 0:
+            if node.args.vararg is None:
+                str_args_list.append('*')
+            for kwoarg, d in zip(node.args.kwonlyargs, node.args.kw_defaults):
+                if isinstance(d, ast.Constant):
+                    str_args_list.append("{}={}".format(kwoarg.arg, d.value))
+                elif isinstance(d, ast.Name):
+                    str_args_list.append("{}={}".format(kwoarg.arg, d.id))
+        if node.args.kwarg is not None:
+            str_args_list.append('**' + node.args.kwarg.arg)
+
+    return ', '.join(str_args_list)
+
+
+# using `doc_filename`
+def gen_en_files(api_label_file="api_label"):
+    """
+    generate all the en doc files.
+    """
+    with open(api_label_file, 'w') as api_label:
+        for id_api, api_info in api_info_dict.items():
+            # api_info = api_info_dict[id_api]
+            if "display" in api_info and not api_info["display"]:
+                logger.debug("{} display False".format(id_api))
+                continue
+            if "doc_filename" not in api_info:
+                logger.debug(
+                    "{} does not have doc_filename field.".format(id_api))
+                continue
+            else:
+                logger.debug(api_info["doc_filename"])
+            path = os.path.dirname(api_info["doc_filename"])
+            if not os.path.exists(path):
+                os.makedirs(path)
+            f = api_info["doc_filename"] + en_suffix
+            if os.path.exists(f):
+                continue
+            gen = EnDocGenerator()
+            with gen.guard(f):
+                gen.module_name = api_info["module_name"]
+                gen.api = api_info["short_name"]
+                gen.print_header_reminder()
+                gen.print_item()
+                api_label.write("{1}\t.. _api_{0}_{1}:\n".format("_".join(
+                    gen.module_name.split(".")), gen.api))
+
+
+class EnDocGenerator(object):
+    """
+    skip
+    """
+
+    def __init__(self, name=None, api=None):
+        """
+        init
+        """
+        self.module_name = name
+        self.api = api
+        self.stream = None
+
+    @contextlib.contextmanager
+    def guard(self, filename):
+        """
+        open the file
+        """
+        assert self.stream is None, "stream must be None"
+        self.stream = open(filename, 'w')
+        yield
+        self.stream.close()
+        self.stream = None
+
+    def print_item(self):
+        """
+        as name
+        """
+        try:
+            m = eval(self.module_name + "." + self.api)
+        except AttributeError:
+            logger.warning("attribute error: module_name=" + self.module_name +
+                           ", api=" + self.api)
+            pass
+        else:
+            if isinstance(eval(self.module_name + "." + self.api), type):
+                self.print_class()
+            elif isinstance(
+                    eval(self.module_name + "." + self.api),
+                    types.FunctionType):
+                self.print_function()
+
+    def print_header_reminder(self):
+        """
+        as name
+        """
+        self.stream.write('''..  THIS FILE IS GENERATED BY `gen_doc.{py|sh}`
+    !DO NOT EDIT THIS FILE MANUALLY!
+
+''')
+
+    def _print_ref_(self):
+        """
+        as name
+        """
+        self.stream.write(".. _api_{0}_{1}:\n\n".format("_".join(
+            self.module_name.split(".")), self.api))
+
+    def _print_header_(self, name, dot, is_title):
+        """
+        as name
+        """
+        dot_line = dot * len(name)
+        if is_title:
+            self.stream.write(dot_line)
+            self.stream.write('\n')
+        self.stream.write(name)
+        self.stream.write('\n')
+        self.stream.write(dot_line)
+        self.stream.write('\n')
+        self.stream.write('\n')
+
+    def print_class(self):
+        """
+        as name
+        """
+        self._print_ref_()
+        self._print_header_(self.api, dot='-', is_title=False)
+
+        cls_templates = {
+            'default':
+            '''..  autoclass:: {0}
+    :members:
+    :inherited-members:
+    :noindex:
+
+''',
+            'no-inherited':
+            '''..  autoclass:: {0}
+    :members:
+    :noindex:
+
+'''
+        }
+        tmpl = 'no-inherited'
+
+        api_full_name = "{}.{}".format(self.module_name, self.api)
+        self.stream.write(cls_templates[tmpl].format(api_full_name))
+
+    def print_function(self):
+        """
+        as name
+        """
+        self._print_ref_()
+        self._print_header_(self.api, dot='-', is_title=False)
+        self.stream.write('''..  autofunction:: {0}.{1}
+    :noindex:
+
+'''.format(self.module_name, self.api))
+
+
+def filter_api_info_dict():
+    for id_api in api_info_dict:
+        if "all_names" in api_info_dict[id_api]:
+            api_info_dict[id_api]["all_names"] = list(
+                api_info_dict[id_api]["all_names"])
+        if "object" in api_info_dict[id_api]:
+            del api_info_dict[id_api]["object"]
+
+
+def reset_api_info_dict():
+    global api_info_dict, parsed_mods
+    api_info_dict = {}
+    parsed_mods = {}
+
+
+if __name__ == "__main__":
+
+    # for api manager
+    reset_api_info_dict()
+    get_all_api(attr="__dict__")
+    set_source_code_attrs()
+    filter_api_info_dict()
+    json.dump(api_info_dict, open("api_info_dict.json", "w"), indent=4)
+
+    # for api rst files
+    reset_api_info_dict()
+    get_all_api(attr="__all__")
+    set_source_code_attrs()
+    filter_api_info_dict()
+    json.dump(api_info_dict, open("api_info_all.json", "w"), indent=4)
+    gen_en_files()
